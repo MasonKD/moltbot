@@ -21,6 +21,5 @@ jobs:
             --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
             --document-name "AWS-RunShellScript" \
             --comment "Deploy moltbot from GitHub Actions" \
-            --parameters commands=["${{ secrets.DEPLOY_COMMAND }}"] \
-            --query "Command.CommandId" \
+            --parameters '{"commands":["bash -lc '\''~/apps/moltbot/deploy.sh'\''"]}' \
             --output text
