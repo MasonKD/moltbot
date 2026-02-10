@@ -1,0 +1,24 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "SSMSendCommandToThisInstanceOnly",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:SendCommand"
+      ],
+      "Resource": [
+        "arn:aws:ec2:us-east-2:854108471347:instance/i-032f532498d5bc6fc",
+        "arn:aws:ssm:us-east-2::document/AWS-RunShellScript"
+      ]
+    },
+    {
+      "Sid": "ReadCommandResult",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetCommandInvocation"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
