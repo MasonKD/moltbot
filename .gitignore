@@ -4,3 +4,4 @@ molt-key.pem
 __pycache__/
 *.py[cod]
 *.pyo
+*.log

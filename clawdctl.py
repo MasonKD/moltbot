@@ -24,6 +24,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -52,6 +53,16 @@ SSH_KEY_PATH = os.getenv("SSH_KEY_PATH", "./molt-key.pem")
 SSH_USER = os.getenv("SSH_USER", "ubuntu")
 CLAWD_BOOTSTRAP_SCRIPT = os.getenv("CLAWD_BOOTSTRAP_SCRIPT", "./clawd-bootstrap.sh")
 CLAWD_BOOTSTRAP_REMOTE_PATH = os.getenv("CLAWD_BOOTSTRAP_REMOTE_PATH", "/tmp/clawd-bootstrap.sh")
+ACTION_CHOICES = ("l", "t", "s", "h", "n", "b", "x")
+ACTION_FLAG_BY_KEY = {
+    "l": "--list",
+    "t": "--terminate",
+    "s": "--ssm",
+    "h": "--ssh",
+    "n": "--launch",
+    "b": "--bootstrap",
+    "x": "--reset",
+}
 
 # Prefer Ubuntu 24.04 ARM64 (Canonical public SSM parameter); fallback to 22.04
 UBUNTU_AMI_PARAMS = [
@@ -115,6 +126,38 @@ def run_interactive(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
         return subprocess.run(cmd, text=True)
     finally:
         signal.signal(signal.SIGINT, old_sigint)
+
+
+def tracked_reload_files() -> List[str]:
+    return [
+        os.path.realpath(__file__),
+        os.path.realpath(CLAWD_BOOTSTRAP_SCRIPT),
+    ]
+
+
+def snapshot_reload_state(paths: Sequence[str]) -> Dict[str, float]:
+    state: Dict[str, float] = {}
+    for path in paths:
+        try:
+            state[path] = float(os.path.getmtime(path))
+        except OSError:
+            state[path] = -1.0
+    return state
+
+
+def changed_reload_files(state: Dict[str, float]) -> List[str]:
+    current = snapshot_reload_state(list(state.keys()))
+    return [path for path, old_mtime in state.items() if current.get(path, -1.0) != old_mtime]
+
+
+def reload_self(action: Optional[str] = None) -> None:
+    eprint("Reloading clawdctl to pick up local changes...")
+    args: List[str] = [sys.executable, sys.argv[0]]
+    if action:
+        flag = ACTION_FLAG_BY_KEY.get(action)
+        if flag:
+            args.append(flag)
+    os.execv(sys.executable, args)
 
 
 @contextmanager
@@ -524,6 +567,7 @@ systemctl start  amazon-ssm-agent 2>/dev/null || true
         commands: List[str],
         *,
         comment: str,
+        step: str,
         timeout_seconds: int = 900,
         poll_seconds: int = 2,
     ) -> None:
@@ -565,14 +609,27 @@ systemctl start  amazon-ssm-agent 2>/dev/null || true
                 return
             if status in {"Pending", "InProgress", "Delayed"}:
                 if time.time() >= deadline:
-                    raise RuntimeError(f"SSM command timed out (status={status}, command_id={command_id})")
+                    raise RuntimeError(
+                        f"SSM {step} timed out (status={status}, command_id={command_id}). "
+                        f"Inspect with: aws --profile {PROFILE} --region {REGION} ssm get-command-invocation "
+                        f"--command-id {command_id} --instance-id {instance_id}"
+                    )
                 time.sleep(poll_seconds)
                 continue
+            stdout = str((inv or {}).get("StandardOutputContent", "")).strip()
             stderr = str((inv or {}).get("StandardErrorContent", "")).strip()
-            raise RuntimeError(
-                f"SSM command failed (status={status}, command_id={command_id})"
-                + (f": {stderr}" if stderr else "")
+            stdout_snip = stdout[-1200:] if stdout else ""
+            stderr_snip = stderr[-1200:] if stderr else ""
+            msg = (
+                f"SSM {step} failed (status={status}, command_id={command_id}). "
+                f"Inspect with: aws --profile {PROFILE} --region {REGION} ssm get-command-invocation "
+                f"--command-id {command_id} --instance-id {instance_id}"
             )
+            if stderr_snip:
+                msg += f"\n--- stderr (last {len(stderr_snip)} chars) ---\n{stderr_snip}"
+            if stdout_snip:
+                msg += f"\n--- stdout (last {len(stdout_snip)} chars) ---\n{stdout_snip}"
+            raise RuntimeError(msg)
 
     def copy_bootstrap_script_via_ssm(self, instance_id: str) -> None:
         if not os.path.isfile(CLAWD_BOOTSTRAP_SCRIPT):
@@ -590,14 +647,20 @@ systemctl start  amazon-ssm-agent 2>/dev/null || true
             ]
         )
         eprint(f"Copying bootstrap script to {instance_id} via SSM...")
-        self._run_ssm_shell_commands(instance_id, [write_cmd], comment="clawdctl copy bootstrap script")
+        self._run_ssm_shell_commands(
+            instance_id,
+            [write_cmd],
+            comment="clawdctl copy bootstrap script",
+            step="copy bootstrap script",
+        )
 
     def run_bootstrap_script_via_ssm(self, instance_id: str) -> None:
         eprint(f"Running bootstrap script on {instance_id} via SSM...")
         self._run_ssm_shell_commands(
             instance_id,
-            [f"sudo bash {CLAWD_BOOTSTRAP_REMOTE_PATH}"],
+            [f"bash {CLAWD_BOOTSTRAP_REMOTE_PATH}"],
             comment="clawdctl run bootstrap script",
+            step="run bootstrap script",
         )
         eprint("Bootstrap completed.")
 
@@ -793,149 +856,225 @@ def menu_title() -> None:
     eprint(f"Project tag: {PROJECT_TAG_KEY}={PROJECT_TAG_VALUE}")
 
 
+def maybe_auto_reload_for_action(
+    reload_state: Optional[Dict[str, float]],
+    action_key: str,
+    action_name: str,
+) -> None:
+    if reload_state is None:
+        return
+    changed = changed_reload_files(reload_state)
+    if changed:
+        eprint(f"Detected local file changes before {action_name}.")
+        for path in changed:
+            eprint(f"  - {path}")
+        reload_self(action_key)
+
+
+def run_action(
+    svc: ClawdService,
+    choice: str,
+    *,
+    reload_state: Optional[Dict[str, float]],
+    pause_after: bool,
+) -> bool:
+    def pause() -> None:
+        if pause_after:
+            prompt("\nPress Enter to continue...")
+
+    if choice == "l":
+        instances = svc.list_running_instances()
+        show_instances(instances)
+        pause()
+        return False
+
+    if choice == "t":
+        maybe_auto_reload_for_action(reload_state, "t", "terminate")
+        instances = svc.list_running_instances()
+        show_instances(instances)
+        if not instances:
+            pause()
+            return False
+
+        ids = choose_instances(instances)
+        if not ids:
+            eprint("No instances selected.")
+            pause()
+            return False
+
+        eprint("\nAbout to terminate:")
+        for i in ids:
+            eprint(f"  - {i}")
+
+        confirm = prompt("\nType TERMINATE to confirm: ").strip()
+        if confirm != "TERMINATE":
+            eprint("Canceled. No instances terminated.")
+            pause()
+            return False
+
+        svc.terminate_instances(ids)
+        eprint("Termination initiated.")
+        pause()
+        return False
+
+    if choice == "s":
+        instances = svc.list_running_instances()
+        show_instances(instances)
+        if not instances:
+            pause()
+            return False
+
+        eprint("\nSelect one instance for Session Manager:")
+        selected = choose_single_instance(instances)
+        if selected is None:
+            pause()
+            return False
+        if selected.state != "running":
+            eprint(f"Instance {selected.instance_id} is '{selected.state}'. It must be running for SSM.")
+            pause()
+            return False
+
+        status = svc.get_ssm_ping_status(selected.instance_id)
+        if status != "Online":
+            eprint(f"SSM PingStatus is {status or 'Unavailable'} for {selected.instance_id}.")
+            if prompt_yes_no("Wait for SSM to become Online?", default_no=True):
+                svc.wait_for_ssm_online(selected.instance_id)
+
+        svc.start_ssm_session(selected.instance_id)
+        pause()
+        return False
+
+    if choice == "h":
+        instances = svc.list_running_instances()
+        show_instances(instances)
+        if not instances:
+            pause()
+            return False
+
+        eprint("\nSelect one instance for SSH:")
+        selected = choose_single_instance(instances)
+        if selected is None:
+            pause()
+            return False
+        if selected.state != "running":
+            eprint(f"Instance {selected.instance_id} is '{selected.state}'. It must be running for SSH.")
+            pause()
+            return False
+        if selected.public_ip == "-":
+            eprint(f"Instance {selected.instance_id} has no public IP; SSH cannot connect directly.")
+            pause()
+            return False
+
+        svc.ssh_with_temporary_ingress(selected.instance_id, selected.public_ip)
+        pause()
+        return False
+
+    if choice == "n":
+        maybe_auto_reload_for_action(reload_state, "n", "launch")
+        inst_id = svc.launch_instance()
+        if prompt_yes_no(
+            f"Wait until SSM is Online for {inst_id} and run clawd bootstrap?",
+            default_no=True,
+        ):
+            svc.wait_for_ssm_online(inst_id)
+            svc.copy_bootstrap_script_via_ssm(inst_id)
+            svc.run_bootstrap_script_via_ssm(inst_id)
+        pause()
+        return False
+
+    if choice == "b":
+        maybe_auto_reload_for_action(reload_state, "b", "bootstrap")
+        instances = svc.list_running_instances()
+        show_instances(instances)
+        if not instances:
+            pause()
+            return False
+
+        eprint("\nSelect one running instance for bootstrap:")
+        selected = choose_single_instance(instances)
+        if selected is None:
+            pause()
+            return False
+        if selected.state != "running":
+            eprint(f"Instance {selected.instance_id} is '{selected.state}'. It must be running for bootstrap.")
+            pause()
+            return False
+
+        status = svc.get_ssm_ping_status(selected.instance_id)
+        if status != "Online":
+            eprint(f"SSM PingStatus is {status or 'Unavailable'} for {selected.instance_id}.")
+            if not prompt_yes_no("Wait for SSM to become Online and continue bootstrap?", default_no=True):
+                pause()
+                return False
+            svc.wait_for_ssm_online(selected.instance_id)
+
+        svc.copy_bootstrap_script_via_ssm(selected.instance_id)
+        svc.run_bootstrap_script_via_ssm(selected.instance_id)
+        pause()
+        return False
+
+    if choice == "x":
+        maybe_auto_reload_for_action(reload_state, "x", "reset")
+        instances = svc.list_running_instances()
+        show_instances(instances)
+        if instances:
+            ids = [i.instance_id for i in instances]
+            eprint("\nThis reset will terminate ALL listed instances above.")
+            confirm = prompt("Type TERMINATE to confirm: ").strip()
+            if confirm != "TERMINATE":
+                eprint("Canceled. No instances terminated.")
+                pause()
+                return False
+            svc.terminate_instances(ids)
+            eprint("Termination initiated.")
+        else:
+            eprint("No instances to terminate.")
+
+        if prompt_yes_no("\nLaunch a new instance now?", default_no=True):
+            inst_id = svc.launch_instance()
+            if prompt_yes_no(
+                f"Wait until SSM is Online for {inst_id} and run clawd bootstrap?",
+                default_no=True,
+            ):
+                svc.wait_for_ssm_online(inst_id)
+                svc.copy_bootstrap_script_via_ssm(inst_id)
+                svc.run_bootstrap_script_via_ssm(inst_id)
+        pause()
+        return False
+
+    if choice == "r":
+        reload_self()
+
+    if choice == "q":
+        eprint("Bye.")
+        return True
+
+    eprint("Invalid choice.")
+    pause()
+    return False
+
+
 def menu_loop(svc: ClawdService) -> None:
+    reload_state = snapshot_reload_state(tracked_reload_files())
+
     while True:
         menu_title()
         eprint("\nChoose an action:")
-        eprint("  1) List all instances (all states)")
-        eprint("  2) Terminate instances (select) ")
-        eprint("  3) SSM session to an instance")
-        eprint("  4) SSH (temporary ingress from current IP)")
-        eprint("  5) Launch new instance (Ubuntu ARM, SSM-ready)")
-        eprint("  6) Reset (terminate -> optionally launch)")
-        eprint("  7) Exit")
+        eprint("  l) List all instances (all states)")
+        eprint("  t) Terminate instances (select)")
+        eprint("  s) SSM session to an instance")
+        eprint("  h) SSH (temporary ingress from current IP)")
+        eprint("  n) Launch new instance (Ubuntu ARM, SSM-ready)")
+        eprint("  b) Bootstrap a running instance via SSM")
+        eprint("  x) Reset (terminate -> optionally launch)")
+        eprint("  r) Reload clawdctl")
+        eprint("  q) Exit")
 
-        choice = prompt("\nEnter choice: ").strip()
+        choice = prompt("\nEnter choice [l/t/s/h/n/b/x/r/q]: ").strip().lower()
 
         try:
-            if choice == "1":
-                instances = svc.list_running_instances()
-                show_instances(instances)
-                prompt("\nPress Enter to continue...")
-
-            elif choice == "2":
-                instances = svc.list_running_instances()
-                show_instances(instances)
-                if not instances:
-                    prompt("\nPress Enter to continue...")
-                    continue
-
-                ids = choose_instances(instances)
-                if not ids:
-                    eprint("No instances selected.")
-                    prompt("\nPress Enter to continue...")
-                    continue
-
-                eprint("\nAbout to terminate:")
-                for i in ids:
-                    eprint(f"  - {i}")
-
-                confirm = prompt("\nType TERMINATE to confirm: ").strip()
-                if confirm != "TERMINATE":
-                    eprint("Canceled. No instances terminated.")
-                    prompt("\nPress Enter to continue...")
-                    continue
-
-                svc.terminate_instances(ids)
-                eprint("Termination initiated.")
-                prompt("\nPress Enter to continue...")
-
-            elif choice == "3":
-                instances = svc.list_running_instances()
-                show_instances(instances)
-                if not instances:
-                    prompt("\nPress Enter to continue...")
-                    continue
-
-                eprint("\nSelect one instance for Session Manager:")
-                selected = choose_single_instance(instances)
-                if selected is None:
-                    prompt("\nPress Enter to continue...")
-                    continue
-                if selected.state != "running":
-                    eprint(f"Instance {selected.instance_id} is '{selected.state}'. It must be running for SSM.")
-                    prompt("\nPress Enter to continue...")
-                    continue
-
-                status = svc.get_ssm_ping_status(selected.instance_id)
-                if status != "Online":
-                    eprint(f"SSM PingStatus is {status or 'Unavailable'} for {selected.instance_id}.")
-                    if prompt_yes_no("Wait for SSM to become Online?", default_no=True):
-                        svc.wait_for_ssm_online(selected.instance_id)
-
-                svc.start_ssm_session(selected.instance_id)
-                prompt("\nPress Enter to continue...")
-
-            elif choice == "4":
-                instances = svc.list_running_instances()
-                show_instances(instances)
-                if not instances:
-                    prompt("\nPress Enter to continue...")
-                    continue
-
-                eprint("\nSelect one instance for SSH:")
-                selected = choose_single_instance(instances)
-                if selected is None:
-                    prompt("\nPress Enter to continue...")
-                    continue
-                if selected.state != "running":
-                    eprint(f"Instance {selected.instance_id} is '{selected.state}'. It must be running for SSH.")
-                    prompt("\nPress Enter to continue...")
-                    continue
-                if selected.public_ip == "-":
-                    eprint(f"Instance {selected.instance_id} has no public IP; SSH cannot connect directly.")
-                    prompt("\nPress Enter to continue...")
-                    continue
-
-                svc.ssh_with_temporary_ingress(selected.instance_id, selected.public_ip)
-                prompt("\nPress Enter to continue...")
-
-            elif choice == "5":
-                inst_id = svc.launch_instance()
-                if prompt_yes_no(
-                    f"Wait until SSM is Online for {inst_id} and run clawd bootstrap?",
-                    default_no=True,
-                ):
-                    svc.wait_for_ssm_online(inst_id)
-                    svc.copy_bootstrap_script_via_ssm(inst_id)
-                    svc.run_bootstrap_script_via_ssm(inst_id)
-                prompt("\nPress Enter to continue...")
-
-            elif choice == "6":
-                instances = svc.list_running_instances()
-                show_instances(instances)
-                if instances:
-                    ids = [i.instance_id for i in instances]
-                    eprint("\nThis reset will terminate ALL listed instances above.")
-                    confirm = prompt("Type TERMINATE to confirm: ").strip()
-                    if confirm != "TERMINATE":
-                        eprint("Canceled. No instances terminated.")
-                        prompt("\nPress Enter to continue...")
-                        continue
-                    svc.terminate_instances(ids)
-                    eprint("Termination initiated.")
-                else:
-                    eprint("No instances to terminate.")
-
-                if prompt_yes_no("\nLaunch a new instance now?", default_no=True):
-                    inst_id = svc.launch_instance()
-                    if prompt_yes_no(
-                        f"Wait until SSM is Online for {inst_id} and run clawd bootstrap?",
-                        default_no=True,
-                    ):
-                        svc.wait_for_ssm_online(inst_id)
-                        svc.copy_bootstrap_script_via_ssm(inst_id)
-                        svc.run_bootstrap_script_via_ssm(inst_id)
-
-                prompt("\nPress Enter to continue...")
-
-            elif choice == "7":
-                eprint("Bye.")
+            if run_action(svc, choice, reload_state=reload_state, pause_after=True):
                 return
-
-            else:
-                eprint("Invalid choice.")
-                prompt("\nPress Enter to continue...")
 
         except KeyboardInterrupt:
             eprint("\nInterrupted. Returning to menu.")
@@ -948,11 +1087,71 @@ def menu_loop(svc: ClawdService) -> None:
             prompt("\nPress Enter to continue...")
 
 
+class ClawdArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        self.print_help(sys.stderr)
+        self.exit(2, f"\nerror: {message}\n")
+
+
 def main() -> None:
+    parser = ClawdArgumentParser(description="clawdctl EC2 lifecycle helper")
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Increase verbosity (reserved; supports stacking, e.g. -vvv)",
+    )
+    parser.add_argument(
+        "-q",
+        "--quiet",
+        action="count",
+        default=0,
+        help="Decrease output verbosity (reserved; supports stacking, e.g. -qq)",
+    )
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("-l", "--list", action="store_true", help="List all instances (all states)")
+    actions.add_argument("-t", "--terminate", action="store_true", help="Terminate instances (select)")
+    actions.add_argument("-s", "--ssm", action="store_true", help="Start SSM session to an instance")
+    actions.add_argument("-p", "--ssh", action="store_true", help="SSH with temporary ingress from current IP")
+    actions.add_argument("-n", "--launch", action="store_true", help="Launch new instance")
+    actions.add_argument("-b", "--bootstrap", action="store_true", help="Bootstrap a running instance via SSM")
+    actions.add_argument("-x", "--reset", action="store_true", help="Reset (terminate then optionally launch)")
+    parser.add_argument(
+        "-i",
+        "--interactive",
+        action="store_true",
+        help="Start interactive menu loop",
+    )
+    args = parser.parse_args()
+    _ = args.verbose, args.quiet
+
     require_aws_cli()
     aws = AwsCli(PROFILE, REGION)
     svc = ClawdService(aws)
-    menu_loop(svc)
+
+    action_key: Optional[str] = None
+    if args.list:
+        action_key = "l"
+    elif args.terminate:
+        action_key = "t"
+    elif args.ssm:
+        action_key = "s"
+    elif args.ssh:
+        action_key = "h"
+    elif args.launch:
+        action_key = "n"
+    elif args.bootstrap:
+        action_key = "b"
+    elif args.reset:
+        action_key = "x"
+
+    if args.interactive or action_key is None:
+        menu_loop(svc)
+        return
+
+    reload_state = snapshot_reload_state(tracked_reload_files())
+    run_action(svc, action_key, reload_state=reload_state, pause_after=False)
 
 
 if __name__ == "__main__":
