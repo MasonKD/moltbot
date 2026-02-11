@@ -18,10 +18,12 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -46,6 +48,10 @@ INSTANCE_TYPE = os.getenv("INSTANCE_TYPE", "t4g.small")
 ROOT_VOL_GB = int(os.getenv("ROOT_VOL_GB", "20"))
 ROOT_VOL_TYPE = os.getenv("ROOT_VOL_TYPE", "gp3")
 MUTATION_LOCK_FILE = os.getenv("CLAWDCTL_LOCK_FILE", "/tmp/clawdctl.lock")
+SSH_KEY_PATH = os.getenv("SSH_KEY_PATH", "./molt-key.pem")
+SSH_USER = os.getenv("SSH_USER", "ubuntu")
+CLAWD_BOOTSTRAP_SCRIPT = os.getenv("CLAWD_BOOTSTRAP_SCRIPT", "./clawd-bootstrap.sh")
+CLAWD_BOOTSTRAP_REMOTE_PATH = os.getenv("CLAWD_BOOTSTRAP_REMOTE_PATH", "/tmp/clawd-bootstrap.sh")
 
 # Prefer Ubuntu 24.04 ARM64 (Canonical public SSM parameter); fallback to 22.04
 UBUNTU_AMI_PARAMS = [
@@ -88,6 +94,27 @@ def require_aws_cli() -> None:
         subprocess.run(["aws", "--version"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         die("aws CLI not found or not runnable. Install/configure AWS CLI first.")
+
+
+def get_current_public_ipv4() -> str:
+    try:
+        with urllib.request.urlopen("https://checkip.amazonaws.com", timeout=5) as resp:
+            ip = resp.read().decode("utf-8").strip()
+    except Exception as ex:
+        raise RuntimeError(f"failed to detect current public IP: {ex}") from ex
+    if not ip:
+        raise RuntimeError("failed to detect current public IP (empty response)")
+    return ip
+
+
+def run_interactive(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
+    """Run an interactive subprocess while ignoring Ctrl+C in clawdctl itself."""
+    old_sigint = signal.getsignal(signal.SIGINT)
+    try:
+        signal.signal(signal.SIGINT, lambda _signum, _frame: None)
+        return subprocess.run(cmd, text=True)
+    finally:
+        signal.signal(signal.SIGINT, old_sigint)
 
 
 @contextmanager
@@ -214,6 +241,17 @@ class ClawdService:
             ["ec2", "describe-instances", "--instance-ids", *instance_ids],
             quiet=True,
         )
+        sg_ids: set[str] = set()
+        for r in (data or {}).get("Reservations", []):
+            for inst in r.get("Instances", []):
+                for sg in inst.get("SecurityGroups", []):
+                    sg_id = sg.get("GroupId")
+                    if sg_id:
+                        sg_ids.add(str(sg_id))
+        return sorted(sg_ids)
+
+    def get_instance_security_groups(self, instance_id: str) -> List[str]:
+        data = self.aws.run_json(["ec2", "describe-instances", "--instance-ids", instance_id], quiet=True)
         sg_ids: set[str] = set()
         for r in (data or {}).get("Reservations", []):
             for inst in r.get("Instances", []):
@@ -480,12 +518,177 @@ systemctl start  amazon-ssm-agent 2>/dev/null || true
                 return
             time.sleep(poll_seconds)
 
+    def _run_ssm_shell_commands(
+        self,
+        instance_id: str,
+        commands: List[str],
+        *,
+        comment: str,
+        timeout_seconds: int = 900,
+        poll_seconds: int = 2,
+    ) -> None:
+        params = json.dumps({"commands": commands})
+        resp = self.aws.run_json(
+            [
+                "ssm",
+                "send-command",
+                "--document-name",
+                "AWS-RunShellScript",
+                "--instance-ids",
+                instance_id,
+                "--comment",
+                comment,
+                "--parameters",
+                params,
+            ],
+            quiet=True,
+        )
+        command_id = ((resp or {}).get("Command", {}) or {}).get("CommandId")
+        if not command_id:
+            raise RuntimeError("failed to start SSM command (missing CommandId)")
+
+        deadline = time.time() + timeout_seconds
+        while True:
+            inv = self.aws.run_json(
+                [
+                    "ssm",
+                    "get-command-invocation",
+                    "--command-id",
+                    str(command_id),
+                    "--instance-id",
+                    instance_id,
+                ],
+                quiet=True,
+            )
+            status = str((inv or {}).get("Status", "Unknown"))
+            if status == "Success":
+                return
+            if status in {"Pending", "InProgress", "Delayed"}:
+                if time.time() >= deadline:
+                    raise RuntimeError(f"SSM command timed out (status={status}, command_id={command_id})")
+                time.sleep(poll_seconds)
+                continue
+            stderr = str((inv or {}).get("StandardErrorContent", "")).strip()
+            raise RuntimeError(
+                f"SSM command failed (status={status}, command_id={command_id})"
+                + (f": {stderr}" if stderr else "")
+            )
+
+    def copy_bootstrap_script_via_ssm(self, instance_id: str) -> None:
+        if not os.path.isfile(CLAWD_BOOTSTRAP_SCRIPT):
+            raise RuntimeError(f"bootstrap script not found: {CLAWD_BOOTSTRAP_SCRIPT}")
+        with open(CLAWD_BOOTSTRAP_SCRIPT, "r", encoding="utf-8") as f:
+            script_body = f.read()
+
+        marker = f"CLAWD_BOOTSTRAP_{now_stamp().replace('-', '_')}"
+        write_cmd = "\n".join(
+            [
+                f"cat > {CLAWD_BOOTSTRAP_REMOTE_PATH} <<'{marker}'",
+                script_body.rstrip("\n"),
+                marker,
+                f"chmod +x {CLAWD_BOOTSTRAP_REMOTE_PATH}",
+            ]
+        )
+        eprint(f"Copying bootstrap script to {instance_id} via SSM...")
+        self._run_ssm_shell_commands(instance_id, [write_cmd], comment="clawdctl copy bootstrap script")
+
+    def run_bootstrap_script_via_ssm(self, instance_id: str) -> None:
+        eprint(f"Running bootstrap script on {instance_id} via SSM...")
+        self._run_ssm_shell_commands(
+            instance_id,
+            [f"sudo bash {CLAWD_BOOTSTRAP_REMOTE_PATH}"],
+            comment="clawdctl run bootstrap script",
+        )
+        eprint("Bootstrap completed.")
+
     def start_ssm_session(self, instance_id: str) -> None:
         cmd = self.aws._base_cmd() + ["ssm", "start-session", "--target", instance_id]
         eprint("$", " ".join(shlex.quote(c) for c in cmd))
-        proc = subprocess.run(cmd)
+        proc = run_interactive(cmd)
+        # Ctrl+C from an interactive session commonly returns 130.
+        if proc.returncode in (0, 130):
+            return
         if proc.returncode != 0:
             raise RuntimeError(f"failed to start SSM session for {instance_id}")
+
+    def ssh_with_temporary_ingress(self, instance_id: str, public_ip: str) -> None:
+        if not os.path.isfile(SSH_KEY_PATH):
+            raise RuntimeError(f"SSH key file not found: {SSH_KEY_PATH}")
+        if not public_ip or public_ip == "-":
+            raise RuntimeError(f"instance {instance_id} does not have a public IP")
+
+        client_ip = get_current_public_ipv4()
+        cidr = f"{client_ip}/32"
+        added_rules: List[str] = []
+
+        with mutation_lock():
+            sg_ids = self.get_instance_security_groups(instance_id)
+            if not sg_ids:
+                raise RuntimeError(f"no security groups found for instance {instance_id}")
+
+            for sg_id in sg_ids:
+                try:
+                    self.aws.run_json(
+                        [
+                            "ec2",
+                            "authorize-security-group-ingress",
+                            "--group-id",
+                            sg_id,
+                            "--protocol",
+                            "tcp",
+                            "--port",
+                            "22",
+                            "--cidr",
+                            cidr,
+                        ],
+                        quiet=True,
+                    )
+                    added_rules.append(sg_id)
+                except RuntimeError as ex:
+                    msg = str(ex)
+                    if "InvalidPermission.Duplicate" in msg:
+                        eprint(f"SSH rule already exists on {sg_id} for {cidr}; will not remove it later.")
+                        continue
+                    raise
+
+        ssh_cmd = [
+            "ssh",
+            "-i",
+            SSH_KEY_PATH,
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            f"{SSH_USER}@{public_ip}",
+        ]
+        eprint("$", " ".join(shlex.quote(c) for c in ssh_cmd))
+
+        try:
+            proc = run_interactive(ssh_cmd)
+            # Treat Ctrl+C as a normal user-cancel for interactive SSH.
+            if proc.returncode in (0, 130):
+                return
+            if proc.returncode != 0:
+                raise RuntimeError(f"ssh exited with status {proc.returncode}")
+        finally:
+            with mutation_lock():
+                for sg_id in added_rules:
+                    try:
+                        self.aws.run_json(
+                            [
+                                "ec2",
+                                "revoke-security-group-ingress",
+                                "--group-id",
+                                sg_id,
+                                "--protocol",
+                                "tcp",
+                                "--port",
+                                "22",
+                                "--cidr",
+                                cidr,
+                            ],
+                            quiet=True,
+                        )
+                    except RuntimeError as ex:
+                        eprint(f"Warning: could not remove temporary SSH rule from {sg_id}: {ex}")
 
 
 # =========================
@@ -597,9 +800,10 @@ def menu_loop(svc: ClawdService) -> None:
         eprint("  1) List all instances (all states)")
         eprint("  2) Terminate instances (select) ")
         eprint("  3) SSM session to an instance")
-        eprint("  4) Launch new instance (Ubuntu ARM, SSM-ready)")
-        eprint("  5) Reset (terminate -> optionally launch)")
-        eprint("  6) Exit")
+        eprint("  4) SSH (temporary ingress from current IP)")
+        eprint("  5) Launch new instance (Ubuntu ARM, SSM-ready)")
+        eprint("  6) Reset (terminate -> optionally launch)")
+        eprint("  7) Exit")
 
         choice = prompt("\nEnter choice: ").strip()
 
@@ -663,12 +867,41 @@ def menu_loop(svc: ClawdService) -> None:
                 prompt("\nPress Enter to continue...")
 
             elif choice == "4":
-                inst_id = svc.launch_instance()
-                if prompt_yes_no(f"Wait until SSM is Online for {inst_id}?", default_no=True):
-                    svc.wait_for_ssm_online(inst_id)
+                instances = svc.list_running_instances()
+                show_instances(instances)
+                if not instances:
+                    prompt("\nPress Enter to continue...")
+                    continue
+
+                eprint("\nSelect one instance for SSH:")
+                selected = choose_single_instance(instances)
+                if selected is None:
+                    prompt("\nPress Enter to continue...")
+                    continue
+                if selected.state != "running":
+                    eprint(f"Instance {selected.instance_id} is '{selected.state}'. It must be running for SSH.")
+                    prompt("\nPress Enter to continue...")
+                    continue
+                if selected.public_ip == "-":
+                    eprint(f"Instance {selected.instance_id} has no public IP; SSH cannot connect directly.")
+                    prompt("\nPress Enter to continue...")
+                    continue
+
+                svc.ssh_with_temporary_ingress(selected.instance_id, selected.public_ip)
                 prompt("\nPress Enter to continue...")
 
             elif choice == "5":
+                inst_id = svc.launch_instance()
+                if prompt_yes_no(
+                    f"Wait until SSM is Online for {inst_id} and run clawd bootstrap?",
+                    default_no=True,
+                ):
+                    svc.wait_for_ssm_online(inst_id)
+                    svc.copy_bootstrap_script_via_ssm(inst_id)
+                    svc.run_bootstrap_script_via_ssm(inst_id)
+                prompt("\nPress Enter to continue...")
+
+            elif choice == "6":
                 instances = svc.list_running_instances()
                 show_instances(instances)
                 if instances:
@@ -686,12 +919,17 @@ def menu_loop(svc: ClawdService) -> None:
 
                 if prompt_yes_no("\nLaunch a new instance now?", default_no=True):
                     inst_id = svc.launch_instance()
-                    if prompt_yes_no(f"Wait until SSM is Online for {inst_id}?", default_no=True):
+                    if prompt_yes_no(
+                        f"Wait until SSM is Online for {inst_id} and run clawd bootstrap?",
+                        default_no=True,
+                    ):
                         svc.wait_for_ssm_online(inst_id)
+                        svc.copy_bootstrap_script_via_ssm(inst_id)
+                        svc.run_bootstrap_script_via_ssm(inst_id)
 
                 prompt("\nPress Enter to continue...")
 
-            elif choice == "6":
+            elif choice == "7":
                 eprint("Bye.")
                 return
 
@@ -700,8 +938,8 @@ def menu_loop(svc: ClawdService) -> None:
                 prompt("\nPress Enter to continue...")
 
         except KeyboardInterrupt:
-            eprint("\nInterrupted.")
-            prompt("Press Enter to continue...")
+            eprint("\nInterrupted. Returning to menu.")
+            continue
         except RuntimeError as ex:
             eprint(f"\nAWS error: {ex}")
             prompt("\nPress Enter to continue...")

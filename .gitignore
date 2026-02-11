@@ -1,1 +1,6 @@
 molt-key.pem
+
+# Python cache / bytecode
+__pycache__/
+*.py[cod]
+*.pyo
